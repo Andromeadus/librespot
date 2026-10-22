@@ -5,6 +5,7 @@ use std::{
     future::Future,
     io::{self, Read, Seek, SeekFrom},
     mem,
+    path::PathBuf,
     pin::Pin,
     process::exit,
     sync::Mutex,
@@ -108,6 +109,7 @@ struct PlayerInternal {
     last_progress_update: Instant,
 
     local_file_lookup: Arc<LocalFileLookup>,
+    offline: Option<Arc<dyn OfflineTracks>>,
     prefetches: Prefetches,
 }
 
@@ -138,6 +140,21 @@ struct Prefetch {
 
 type Prefetches = Arc<Mutex<HashMap<SpotifyUri, Prefetch>>>;
 
+/// Songs an application keeps on this device. The player asks it before
+/// the network, so a kept song plays from disk, with or without a session.
+pub trait OfflineTracks: Send + Sync {
+    fn get(&self, uri: &SpotifyUri) -> Option<OfflineTrack>;
+}
+
+/// A kept song: its file exactly as Spotify serves it, and the key that
+/// opens it.
+pub struct OfflineTrack {
+    pub audio_item: AudioItem,
+    pub format: AudioFileFormat,
+    pub path: PathBuf,
+    pub key: AudioKey,
+}
+
 const PREFETCHES_POISON_MSG: &str = "prefetches mutex should not be poisoned";
 
 static PLAYER_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -159,6 +176,7 @@ enum PlayerCommand {
     SetSession(Session),
     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
     SetSinkEventCallback(Option<SinkEventCallback>),
+    SetOfflineTracks(Option<Arc<dyn OfflineTracks>>),
     EmitVolumeChangedEvent(u16),
     SetAutoNormaliseAsAlbum(bool),
     EmitSessionDisconnectedEvent {
@@ -582,6 +600,7 @@ impl Player {
                 last_progress_update: Instant::now(),
 
                 local_file_lookup: Arc::new(local_file_lookup),
+                offline: None,
                 prefetches: Arc::default(),
             };
 
@@ -679,6 +698,11 @@ impl Player {
 
     pub fn set_sink_event_callback(&self, callback: Option<SinkEventCallback>) {
         self.command(PlayerCommand::SetSinkEventCallback(callback));
+    }
+
+    /// Where the player looks for kept songs first. `None` stops it looking.
+    pub fn set_offline_tracks(&self, offline: Option<Arc<dyn OfflineTracks>>) {
+        self.command(PlayerCommand::SetOfflineTracks(offline));
     }
 
     pub fn emit_volume_changed_event(&self, volume: u16) {
@@ -1036,6 +1060,7 @@ struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
     local_file_lookup: Arc<LocalFileLookup>,
+    offline: Option<Arc<dyn OfflineTracks>>,
 }
 
 impl PlayerTrackLoader {
@@ -1105,6 +1130,12 @@ impl PlayerTrackLoader {
     ) -> Result<PlayerLoadedTrackData, LoadError> {
         match track_uri {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
+                if let Some(loaded) = self
+                    .offline_track(&track_uri)
+                    .and_then(|track| Self::load_offline_track(track, position_ms))
+                {
+                    return Ok(loaded);
+                }
                 self.load_remote_track(track_uri, position_ms, prefetched)
                     .await
             }
@@ -1214,6 +1245,9 @@ impl PlayerTrackLoader {
 
     /// Fetches what [`Player::prefetch`] keeps for an upcoming track.
     async fn prefetch(&self, track_uri: SpotifyUri) -> Option<PrefetchedTrack> {
+        if self.offline_track(&track_uri).is_some() {
+            return None;
+        }
         let track_id: SpotifyId = (&track_uri).try_into().ok()?;
         let track = self.resolve_remote_track(track_uri).await.ok()?;
         let file_id = track.file_id;
@@ -1453,6 +1487,68 @@ impl PlayerTrackLoader {
                 is_explicit,
             });
         }
+    }
+
+    fn offline_track(&self, track_uri: &SpotifyUri) -> Option<OfflineTrack> {
+        self.offline.as_ref()?.get(track_uri)
+    }
+
+    /// Decrypts and decodes a kept song from disk. `None` when it cannot be
+    /// read, so the song streams instead.
+    fn load_offline_track(track: OfflineTrack, position_ms: u32) -> Option<PlayerLoadedTrackData> {
+        let OfflineTrack {
+            audio_item,
+            format,
+            path,
+            key,
+        } = track;
+        info!("Loading <{}> from <{}>", audio_item.name, path.display());
+        let failed =
+            |e: &dyn fmt::Display| error!("Unable to load offline <{}>: {e}", audio_item.name);
+
+        let file = File::open(&path).map_err(|e| failed(&e)).ok()?;
+        let file_size = file.metadata().map_err(|e| failed(&e)).ok()?.len();
+        let mut decrypted_file = AudioDecrypt::new(Some(key), file);
+
+        let (offset, normalisation_data) = if AudioFiles::is_ogg_vorbis(format) {
+            let normalisation_data = NormalisationData::parse_from_ogg(&mut decrypted_file).ok();
+            (SPOTIFY_OGG_HEADER_END, normalisation_data)
+        } else {
+            (0, None)
+        };
+        let audio_file = Subfile::new(decrypted_file, offset, file_size)
+            .map_err(|e| failed(&e))
+            .ok()?;
+
+        let mut hint = Hint::new();
+        if let Some(mime_type) = AudioFiles::mime_type(format) {
+            hint.mime_type(mime_type);
+        }
+        let mut decoder = SymphoniaDecoder::new(audio_file, hint)
+            .map_err(|e| failed(&e))
+            .ok()?;
+        let normalisation_data = normalisation_data
+            .or_else(|| decoder.normalisation_data())
+            .unwrap_or_default();
+
+        let duration_ms = audio_item.duration_ms;
+        let position_ms = if position_ms > duration_ms {
+            0
+        } else {
+            position_ms
+        };
+        let stream_position_ms = decoder.seek(position_ms).map_err(|e| failed(&e)).ok()?;
+
+        Some(PlayerLoadedTrackData {
+            decoder: Box::new(decoder),
+            normalisation_data,
+            stream_loader_controller: StreamLoaderController::from_local_file(file_size),
+            bytes_per_second: (file_size * 1000 / u64::from(duration_ms.max(1))) as usize,
+            duration_ms,
+            stream_position_ms,
+            is_explicit: audio_item.is_explicit,
+            audio_item,
+        })
     }
 
     async fn load_local_track(
@@ -2407,6 +2503,7 @@ impl PlayerInternal {
             session: self.session.clone(),
             config: self.config.clone(),
             local_file_lookup: self.local_file_lookup.clone(),
+            offline: self.offline.clone(),
         }
     }
 
@@ -2581,6 +2678,8 @@ impl PlayerInternal {
             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
 
             PlayerCommand::SetSinkEventCallback(callback) => self.sink_event_callback = callback,
+
+            PlayerCommand::SetOfflineTracks(offline) => self.offline = offline,
 
             PlayerCommand::EmitVolumeChangedEvent(volume) => {
                 self.send_event(PlayerEvent::VolumeChanged { volume })
@@ -2797,6 +2896,7 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::SetSinkEventCallback(_) => {
                 f.debug_tuple("SetSinkEventCallback").finish()
             }
+            PlayerCommand::SetOfflineTracks(_) => f.debug_tuple("SetOfflineTracks").finish(),
             PlayerCommand::EmitVolumeChangedEvent(volume) => f
                 .debug_tuple("EmitVolumeChangedEvent")
                 .field(&volume)
